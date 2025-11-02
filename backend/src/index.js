@@ -6,6 +6,7 @@ import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import { v4 as uuid } from 'uuid';
 import OpenAI from 'openai';
+import PDFDocument from 'pdfkit';
 
 dotenv.config();
 
@@ -280,27 +281,56 @@ app.get('/api/documents/:docId/download', (req, res) => {
   return res.send(buffer);
 });
 
+app.get('/api/documents/:docId/download.pdf', async (req, res) => {
+  const { docId } = req.params;
+  const storedDocument = documentStore.get(docId);
+
+  if (!storedDocument) {
+    return res.status(404).json({ error: 'Document not found' });
+  }
+
+  const html = storedDocument.filledHtml || storedDocument.previewHtml || '';
+
+  try {
+    const pdfBuffer = await createPdfFromHtml(html);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${docId}-document.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('PDF download error', error);
+    return res.status(500).json({ error: 'Unable to generate PDF' });
+  }
+});
+
 async function generateQuestionForPlaceholder(storedDocument, placeholderId) {
   const placeholder = storedDocument.placeholders.find((item) => item.id === placeholderId);
   if (!placeholder) {
     return 'Please provide the required information.';
   }
 
-  const fallbackQuestion = `Please provide a value for "${placeholder.label}".`;
+  const placeholderMeta = storedDocument.placeholderMetadata?.[placeholderId];
+  const contextSnippet = placeholder.context || placeholderMeta?.innerTrimmed || '';
+  const documentOverview = truncateText(storedDocument.normalizedText || '', 800);
+  const signatureMode = isSignaturePlaceholder(placeholder, placeholderMeta);
+
+  const fallbackQuestion = signatureMode
+    ? 'Please list each signing party with their full legal name, title, organisation, and any signing order notes so the signature panel can be completed.'
+    : `Please provide a value for "${placeholder.label}".`;
 
   if (!openaiClient) {
     return fallbackQuestion;
   }
 
-  const placeholderMeta = storedDocument.placeholderMetadata?.[placeholderId];
-  const contextSnippet = placeholder.context || placeholderMeta?.innerTrimmed || '';
-  const documentOverview = truncateText(storedDocument.normalizedText || '', 800);
-
   const systemPrompt = [
     'You are a helpful assistant helping a legal professional complete a document.',
     'Ask the user exactly one concise, polite question to gather the information required for the placeholder.',
     'Do not propose a value yourself and do not ask multiple questions at once.',
-  ].join('\n');
+    signatureMode
+      ? 'This placeholder powers a signature section. Ensure the user provides the full legal names, titles, and organisations for every signing party, along with any extra details needed (e.g. signing order, date lines).'
+      : undefined,
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   const userPromptParts = [
     `Placeholder label: ${placeholder.label}`,
@@ -309,7 +339,9 @@ async function generateQuestionForPlaceholder(storedDocument, placeholderId) {
       : undefined,
     contextSnippet ? `Surrounding text: ${contextSnippet}` : undefined,
     documentOverview ? `Document overview:\n${documentOverview}` : undefined,
-    'Ask the user one question to obtain the correct value for this placeholder.',
+    signatureMode
+      ? 'Request the user to list every signing party with full name, title, organisation, and any signature block particulars (such as signing order or effective date).'
+      : 'Ask the user one question to obtain the correct value for this placeholder.',
   ].filter(Boolean);
 
   try {
@@ -764,6 +796,122 @@ function sanitizeId(value) {
 
   return sanitized;
 }
+
+function isSignaturePlaceholder(placeholder, placeholderMeta) {
+  if (!placeholder) {
+    return false;
+  }
+
+  const haystack = [placeholder.id, placeholder.label, placeholder.context, placeholderMeta?.innerTrimmed, placeholderMeta?.raw]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  if (!haystack) {
+    return false;
+  }
+
+  const keywords = ['signature', 'signatory', 'signatures', 'signing party', 'signature panel', 'signature block'];
+  return keywords.some((keyword) => haystack.includes(keyword));
+}
+
+function stripHtml(value) {
+  return value.replace(/<[^>]+>/g, ' ');
+}
+
+function createPdfFromHtml(html) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ margin: 50 });
+      const chunks = [];
+
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+
+      const paragraphs = htmlToParagraphs(html);
+
+      doc.fontSize(12);
+      paragraphs.forEach((paragraph, index) => {
+        if (paragraph.type === 'heading') {
+          doc.moveDown(index === 0 ? 0 : 0.8);
+          doc.fontSize(paragraph.level >= 3 ? 14 : 16).text(paragraph.text, { align: 'left' });
+          doc.moveDown(0.3);
+          doc.fontSize(12);
+        } else if (paragraph.type === 'list-item') {
+          doc.text(`• ${paragraph.text}`, { indent: 12, paragraphGap: 6 });
+        } else {
+          doc.text(paragraph.text, { paragraphGap: 10 });
+        }
+      });
+
+      doc.end();
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function htmlToParagraphs(html) {
+  if (!html) {
+    return [];
+  }
+
+  const fragments = [];
+  let transformed = html
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\s*li[^>]*>/gi, '\n• ')
+    .replace(/<\/\s*li\s*>/gi, '\n')
+    .replace(/<\/\s*(h[1-6]|p|div)\s*>/gi, '\n\n');
+
+  const headingRegex = /<\s*h([1-6])[^>]*>([\s\S]*?)<\/\s*h\1\s*>/gi;
+  transformed = transformed.replace(headingRegex, (_match, level, content) => {
+    fragments.push({
+      type: 'heading',
+      level: Number(level),
+      text: decodeXmlEntities(stripHtml(content)).trim(),
+    });
+    return '\n\n';
+  });
+
+  const cleaned = stripHtml(transformed);
+  const decoded = decodeXmlEntities(cleaned);
+  const paragraphs = decoded.split(/\n{2,}/).map((item) => item.replace(/\s+\n/g, '\n').trim());
+
+  let fragmentIndex = 0;
+  const result = [];
+
+  paragraphs.forEach((paragraph) => {
+    if (!paragraph) {
+      return;
+    }
+
+    if (paragraph.startsWith('•')) {
+      paragraph
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .forEach((item) => {
+          result.push({ type: 'list-item', text: item.replace(/^•\s*/, '') });
+        });
+      return;
+    }
+
+    if (fragmentIndex < fragments.length) {
+      const fragment = fragments[fragmentIndex];
+      if (fragment && fragment.text.toLowerCase() === paragraph.toLowerCase()) {
+        result.push(fragment);
+        fragmentIndex += 1;
+        return;
+      }
+    }
+
+    result.push({ type: 'paragraph', text: paragraph });
+  });
+
+  return result;
+}
+
 
 function decodeXmlEntities(value) {
   return value

@@ -303,6 +303,30 @@ export default function App() {
     }
   }
 
+  async function downloadPdfDocument() {
+    const doc = documentMeta();
+    if (!doc || (!questionnaireComplete() && !doc.filledPreviewHtml)) return;
+
+    const url = buildUrl(`/api/documents/${encodeURIComponent(doc.docId)}/download.pdf`);
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error('Unable to download PDF');
+      }
+
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = `${doc.docId}-document.pdf`;
+      anchor.click();
+      URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(error instanceof Error ? error.message : 'PDF download failed');
+    }
+  }
+
   return (
     <div class="container">
       <header class="app-header">
@@ -400,6 +424,14 @@ export default function App() {
             </Show>
 
             <div class="chat-actions" style={{ 'margin-top': '1.5rem' }}>
+              <button
+                class="ghost"
+                type="button"
+                onClick={downloadPdfDocument}
+                disabled={!canShowPreview()}
+              >
+                Download PDF
+              </button>
               <button
                 class="ghost"
                 type="button"
