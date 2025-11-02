@@ -1,16 +1,10 @@
-import { createEffect, createMemo, createSignal, For, Show } from 'solid-js';
-import { createStore } from 'solid-js/store';
+import { createMemo, createSignal, For, Show } from 'solid-js';
 import DOMPurify from 'dompurify';
 
 interface Placeholder {
   id: string;
   label: string;
   context?: string;
-}
-
-interface PlaceholderSession {
-  messages: ChatMessage[];
-  value: string;
 }
 
 interface ChatMessage {
@@ -25,13 +19,11 @@ interface UploadResponse {
   previewHtml: string;
 }
 
-interface ConversationResponse {
-  message: { role: 'assistant'; content: string };
-}
-
-interface FinalizeResponse {
-  docId: string;
-  previewHtml: string;
+interface QuestionnaireResponse {
+  done: boolean;
+  message?: string;
+  placeholderId?: string;
+  previewHtml?: string;
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '';
@@ -53,53 +45,49 @@ function newId() {
 
 export default function App() {
   const [documentMeta, setDocumentMeta] = createSignal<UploadResponse & { filledPreviewHtml?: string } | null>(null);
-  const [selectedPlaceholderId, setSelectedPlaceholderId] = createSignal<string | null>(null);
-  const [sessions, setSessions] = createStore<Record<string, PlaceholderSession>>({});
+  const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
+  const [currentPlaceholderId, setCurrentPlaceholderId] = createSignal<string | null>(null);
+  const [answeredPlaceholderIds, setAnsweredPlaceholderIds] = createSignal<string[]>([]);
   const [uploading, setUploading] = createSignal(false);
   const [chatInput, setChatInput] = createSignal('');
   const [chatLoading, setChatLoading] = createSignal(false);
-  const [finalizing, setFinalizing] = createSignal(false);
+  const [questionnaireActive, setQuestionnaireActive] = createSignal(false);
+  const [questionnaireComplete, setQuestionnaireComplete] = createSignal(false);
   const [statusMessage, setStatusMessage] = createSignal<string | null>(null);
   const [errorMessage, setErrorMessage] = createSignal<string | null>(null);
   const [selectedFileName, setSelectedFileName] = createSignal<string | null>(null);
 
-  const activePlaceholder = createMemo(() => {
-    const doc = documentMeta();
-    if (!doc) return undefined;
-    const current = selectedPlaceholderId();
-    return doc.placeholders.find((item) => item.id === current);
-  });
+  const placeholderCount = createMemo(() => documentMeta()?.placeholders.length ?? 0);
+  const answeredCount = createMemo(() => answeredPlaceholderIds().length);
+  const remainingQuestions = createMemo(() => Math.max(placeholderCount() - answeredCount(), 0));
 
-  const activeSession = createMemo(() => {
-    const current = selectedPlaceholderId();
-    if (!current) return undefined;
-    return sessions[current];
+  const canShowPreview = createMemo(() => {
+    const doc = documentMeta();
+    if (!doc) return false;
+    if (doc.filledPreviewHtml) return true;
+    return questionnaireComplete();
   });
 
   const sanitizedPreview = createMemo(() => {
     const doc = documentMeta();
     if (!doc) return '';
-    const html = doc.filledPreviewHtml ?? doc.previewHtml;
-    return DOMPurify.sanitize(html);
+    const html = doc.filledPreviewHtml ?? (questionnaireComplete() ? doc.previewHtml : '');
+    return html ? DOMPurify.sanitize(html) : '';
   });
 
-  createEffect(() => {
-    const doc = documentMeta();
-    if (!doc) return;
-    if (!selectedPlaceholderId() && doc.placeholders.length > 0) {
-      const firstId = doc.placeholders[0]?.id ?? null;
-      if (firstId) {
-        setSelectedPlaceholderId(firstId);
-      }
-    }
-  });
-
-  createEffect(() => {
-    const placeholderId = selectedPlaceholderId();
-    if (placeholderId) {
-      setChatInput('');
-    }
-  });
+  function resetState() {
+    setDocumentMeta(null);
+    setChatMessages([]);
+    setCurrentPlaceholderId(null);
+    setAnsweredPlaceholderIds([]);
+    setChatInput('');
+    setChatLoading(false);
+    setQuestionnaireActive(false);
+    setQuestionnaireComplete(false);
+    setStatusMessage(null);
+    setErrorMessage(null);
+    setSelectedFileName(null);
+  }
 
   function handleFileChange(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
@@ -114,6 +102,14 @@ export default function App() {
     setUploading(true);
     setErrorMessage(null);
     setStatusMessage(null);
+    setChatMessages([]);
+    setCurrentPlaceholderId(null);
+    setAnsweredPlaceholderIds([]);
+    setChatInput('');
+    setQuestionnaireActive(false);
+    setQuestionnaireComplete(false);
+    setDocumentMeta(null);
+
     try {
       const formData = new FormData();
       formData.append('file', file);
@@ -130,12 +126,8 @@ export default function App() {
 
       const payload = (await response.json()) as UploadResponse;
       setDocumentMeta({ ...payload });
-      setSessions(() => ({}));
-      payload.placeholders.forEach((placeholder) => {
-        setSessions(placeholder.id, { messages: [], value: '' });
-      });
-      setSelectedPlaceholderId(payload.placeholders[0]?.id ?? null);
-      setStatusMessage(`Found ${payload.placeholders.length} placeholders to review.`);
+      setStatusMessage('Preparing the assistant for your template...');
+      await startQuestionnaire(payload.docId);
     } catch (error) {
       console.error(error);
       setErrorMessage(error instanceof Error ? error.message : 'Upload failed');
@@ -144,135 +136,142 @@ export default function App() {
     }
   }
 
-  async function sendMessage(event: Event) {
-    event.preventDefault();
-    const doc = documentMeta();
-    const placeholder = activePlaceholder();
-    const message = chatInput().trim();
+  async function startQuestionnaire(docId: string) {
+    if (!docId) return;
 
-    if (!doc || !placeholder || !message) return;
-
-    const placeholderId = placeholder.id;
-    const existingMessages = sessions[placeholderId]?.messages ?? [];
-    const userMessage = { role: 'user' as const, content: message, id: newId() };
-    const conversationPayload = [
-      ...existingMessages.map(({ role, content }) => ({ role, content })),
-      { role: 'user', content: message },
-    ];
-
-    setSessions(placeholderId, (current) => current ?? { messages: [], value: '' });
-    setSessions(placeholderId, 'messages', (prev) => [...(prev ?? []), userMessage]);
+    setChatMessages([]);
+    setCurrentPlaceholderId(null);
+    setAnsweredPlaceholderIds([]);
+    setQuestionnaireComplete(false);
+    setQuestionnaireActive(false);
     setChatInput('');
     setChatLoading(true);
+    setErrorMessage(null);
 
     try {
-      const response = await fetch(buildUrl('/api/conversation'), {
+      const response = await fetch(buildUrl('/api/questionnaire/start'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          docId: doc.docId,
-          placeholderId,
-          messages: conversationPayload,
-        }),
+        body: JSON.stringify({ docId }),
       });
 
       if (!response.ok) {
         const payload = (await response.json().catch(() => ({}))) as { error?: string };
-        throw new Error(payload.error ?? 'Assistant failed to respond');
+        throw new Error(payload.error ?? 'Unable to start assistant questionnaire');
       }
 
-      const payload = (await response.json()) as ConversationResponse;
-      const reply = payload.message;
-      setSessions(placeholderId, 'messages', (prev) => [
-        ...prev,
-        { role: 'assistant', content: reply.content, id: newId() },
-      ]);
+      const payload = (await response.json()) as QuestionnaireResponse;
+
+      if (payload.done) {
+        setQuestionnaireComplete(true);
+        setQuestionnaireActive(false);
+        setCurrentPlaceholderId(null);
+        if (payload.previewHtml) {
+          setDocumentMeta((prev) => (prev ? { ...prev, filledPreviewHtml: payload.previewHtml } : prev));
+        }
+        setStatusMessage('Document is ready to preview and download.');
+        return;
+      }
+
+      const placeholderId = payload.placeholderId ?? null;
+      setCurrentPlaceholderId(placeholderId);
+      setQuestionnaireActive(true);
+
+      const assistantMessage: ChatMessage = {
+        role: 'assistant',
+        content: payload.message ?? 'Please provide the required information.',
+        id: newId(),
+      };
+
+      setChatMessages([assistantMessage]);
+      setStatusMessage('Answer the assistant to complete the document.');
     } catch (error) {
       console.error(error);
-      setErrorMessage(error instanceof Error ? error.message : 'Assistant error');
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to start assistant questionnaire');
+      setStatusMessage(null);
+      setQuestionnaireActive(false);
+      setQuestionnaireComplete(false);
+      setChatMessages([]);
+      setCurrentPlaceholderId(null);
     } finally {
       setChatLoading(false);
     }
   }
 
-  function useAssistantReply() {
-    const placeholderId = selectedPlaceholderId();
-    if (!placeholderId) return;
-    const session = sessions[placeholderId];
-    const lastAssistant = [...(session?.messages ?? [])].reverse().find((message) => message.role === 'assistant');
-    if (lastAssistant) {
-      setSessions(placeholderId, 'value', lastAssistant.content);
-    }
-  }
-
-  async function finalizeDocument() {
+  async function submitAnswer(event: Event) {
+    event.preventDefault();
     const doc = documentMeta();
-    if (!doc) return;
+    const placeholderId = currentPlaceholderId();
+    const message = chatInput().trim();
 
-    const missing = doc.placeholders.filter((placeholder) => !sessions[placeholder.id]?.value?.trim());
-    if (missing.length > 0) {
-      setErrorMessage(`Please provide values for: ${missing.map((item) => item.label).join(', ')}`);
+    if (!doc || !placeholderId || !message) {
       return;
     }
 
-    setFinalizing(true);
+    const userMessage: ChatMessage = { role: 'user', content: message, id: newId() };
+    setChatMessages((prev) => [...prev, userMessage]);
+    setChatInput('');
+    setChatLoading(true);
     setErrorMessage(null);
-    setStatusMessage('Finalizing your document...');
 
     try {
-      const values = Object.fromEntries(
-        doc.placeholders.map((placeholder) => [placeholder.id, sessions[placeholder.id]?.value ?? ''])
-      );
-
-      const response = await fetch(buildUrl('/api/finalize'), {
+      const response = await fetch(buildUrl('/api/questionnaire/answer'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           docId: doc.docId,
-          values,
+          answer: message,
         }),
       });
 
       if (!response.ok) {
         const payload = (await response.json().catch(() => ({}))) as { error?: string };
-        throw new Error(payload.error ?? 'Failed to finalize document');
+        throw new Error(payload.error ?? 'Assistant failed to process your answer');
       }
 
-      const payload = (await response.json()) as FinalizeResponse;
-      setDocumentMeta((prev) => (prev ? { ...prev, filledPreviewHtml: payload.previewHtml } : prev));
-      setStatusMessage('Document finalized. You can review the preview or download the .docx file.');
+      const payload = (await response.json()) as QuestionnaireResponse;
+
+      setAnsweredPlaceholderIds((prev) => (prev.includes(placeholderId) ? prev : [...prev, placeholderId]));
+
+      if (payload.done) {
+        setQuestionnaireComplete(true);
+        setQuestionnaireActive(false);
+        setCurrentPlaceholderId(null);
+        if (payload.previewHtml) {
+          setDocumentMeta((prev) => (prev ? { ...prev, filledPreviewHtml: payload.previewHtml } : prev));
+        }
+        setStatusMessage('All placeholders captured. Review the preview and download the .docx file.');
+        return;
+      }
+
+      const nextPlaceholderId = payload.placeholderId ?? null;
+      setCurrentPlaceholderId(nextPlaceholderId);
+
+      const assistantMessage: ChatMessage = {
+        role: 'assistant',
+        content: payload.message ?? 'Please provide the next value.',
+        id: newId(),
+      };
+
+      setChatMessages((prev) => [...prev, assistantMessage]);
+      setStatusMessage('Keep answering until the assistant completes the document.');
     } catch (error) {
       console.error(error);
-      setErrorMessage(error instanceof Error ? error.message : 'Failed to finalize document');
+      setChatMessages((prev) => prev.filter((item) => item.id !== userMessage.id));
+      setChatInput(message);
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to send answer');
     } finally {
-      setFinalizing(false);
+      setChatLoading(false);
     }
-  }
-
-  function handleValueChange(event: Event) {
-    const placeholderId = selectedPlaceholderId();
-    if (!placeholderId) return;
-    const target = event.currentTarget as HTMLTextAreaElement;
-    setSessions(placeholderId, 'value', target.value);
-  }
-
-  function resetState() {
-    setDocumentMeta(null);
-    setSessions(() => ({}));
-    setSelectedPlaceholderId(null);
-    setChatInput('');
-    setStatusMessage(null);
-    setErrorMessage(null);
-    setSelectedFileName(null);
   }
 
   async function downloadDocument() {
     const doc = documentMeta();
-    if (!doc) return;
+    if (!doc || (!questionnaireComplete() && !doc.filledPreviewHtml)) return;
 
     const url = buildUrl(`/api/documents/${encodeURIComponent(doc.docId)}/download`);
     try {
@@ -294,28 +293,25 @@ export default function App() {
     }
   }
 
-  const placeholderCount = createMemo(() => documentMeta()?.placeholders.length ?? 0);
-
   return (
     <div class="container">
       <header class="app-header">
         <h1>Legal Document Assistant</h1>
         <p>
-          Upload a contract template with <strong>{'{{ placeholder }}'}</strong> style tokens to flag dynamic sections. Collaborate with the AI
-          assistant to draft the missing details, preview the completed document, and download the final .docx file.
+          Upload a contract template with placeholders such as <strong>{'{{ client_name }}'}</strong> or <strong>{'$[_____________]'}</strong>.
+          The assistant will gather the missing information and produce a completed document ready for download.
         </p>
       </header>
 
       <section class="card">
         <div class="section-title">
           <h2>1. Upload template</h2>
-          <button class="ghost" type="button" onClick={resetState} disabled={!documentMeta()}>
+          <button class="ghost" type="button" onClick={resetState} disabled={!documentMeta() && !selectedFileName()}>
             Reset
           </button>
         </div>
         <label class="upload-dropzone">
           <strong>Drop a .docx template</strong>
-          {/* <div class="helper-text">or click to browse your files</div> */}
           <input
             type="file"
             accept=".docx"
@@ -336,84 +332,70 @@ export default function App() {
         <div class="layout">
           <section class="card">
             <div class="section-title">
-              <h2>2. Preview</h2>
-              <div class="badge">Placeholders detected: {placeholderCount()}</div>
-            </div>
-            <div class="document-preview" innerHTML={sanitizedPreview()} />
-          </section>
-
-          <section class="card">
-            <div class="section-title">
-              <h2>3. Fill placeholders</h2>
+              <h2>2. Answer the assistant</h2>
+              <div class="badge">
+                {questionnaireComplete()
+                  ? 'All questions answered'
+                  : `Questions remaining: ${remainingQuestions()}`}
+              </div>
             </div>
 
-            <div class="placeholder-list">
-              <For each={documentMeta()?.placeholders ?? []}>
-                {(placeholder) => (
-                  <button
-                    type="button"
-                    class={`placeholder-pill ${selectedPlaceholderId() === placeholder.id ? 'active' : ''}`}
-                    onClick={() => setSelectedPlaceholderId(placeholder.id)}
-                  >
-                    {placeholder.label}
-                  </button>
+            <div class="chat-thread">
+              <Show when={!chatMessages().length && chatLoading()}>
+                <div class="status">Preparing your first question…</div>
+              </Show>
+              <For each={chatMessages()}>
+                {(message) => (
+                  <div class={`chat-bubble ${message.role}`}>
+                    {message.content}
+                  </div>
                 )}
               </For>
             </div>
 
-            <Show when={activePlaceholder()}>
-              {(placeholder) => (
-                <div class="values-panel">
-                  <Show when={placeholder().context}>
-                    {(context) => <div class="badge">Context: {context}</div>}
-                  </Show>
+            <form onSubmit={submitAnswer}>
+              <textarea
+                placeholder={
+                  questionnaireComplete()
+                    ? 'All questions answered'
+                    : questionnaireActive()
+                    ? 'Type your answer and press send'
+                    : 'Waiting for the assistant...'
+                }
+                value={chatInput()}
+                onInput={(event) => setChatInput(event.currentTarget.value)}
+                disabled={chatLoading() || questionnaireComplete() || !questionnaireActive()}
+                required
+              />
+              <div class="chat-actions">
+                <button
+                  class="primary"
+                  type="submit"
+                  disabled={chatLoading() || questionnaireComplete() || !questionnaireActive()}
+                >
+                  {chatLoading() ? 'Processing…' : 'Send answer'}
+                </button>
+              </div>
+            </form>
+          </section>
 
-                  <div class="chat-thread">
-                    <For each={activeSession()?.messages ?? []}>
-                      {(message) => (
-                        <div class={`chat-bubble ${message.role}`}>
-                          {message.content}
-                        </div>
-                      )}
-                    </For>
-                  </div>
+          <section class="card">
+            <div class="section-title">
+              <h2>3. Preview & download</h2>
+              <div class="badge">Placeholders detected: {placeholderCount()}</div>
+            </div>
 
-                  <form onSubmit={sendMessage}>
-                    <textarea
-                      placeholder={`Ask for help filling ${placeholder().label}`}
-                      value={chatInput()}
-                      onInput={(event) => setChatInput(event.currentTarget.value)}
-                      disabled={chatLoading()}
-                      required
-                    />
-                    <div class="chat-actions">
-                      <button class="primary" type="submit" disabled={chatLoading()}>
-                        {chatLoading() ? 'Thinking…' : 'Ask assistant'}
-                      </button>
-                      <button
-                        type="button"
-                        class="ghost"
-                        onClick={useAssistantReply}
-                        disabled={!activeSession()?.messages?.length}
-                      >
-                        Use last reply
-                      </button>
-                    </div>
-                  </form>
-
-                  <label>
-                    Provide final value
-                    <textarea value={activeSession()?.value ?? ''} onInput={handleValueChange} />
-                  </label>
-                </div>
-              )}
+            <Show when={canShowPreview()} fallback={<div class="status">Preview unlocks after the assistant finishes gathering answers.</div>}>
+              <div class="document-preview" innerHTML={sanitizedPreview()} />
             </Show>
 
             <div class="chat-actions" style={{ 'margin-top': '1.5rem' }}>
-              <button class="primary" type="button" onClick={finalizeDocument} disabled={finalizing()}>
-                {finalizing() ? 'Finalizing…' : 'Finalize & preview'}
-              </button>
-              <button class="ghost" type="button" onClick={downloadDocument}>
+              <button
+                class="ghost"
+                type="button"
+                onClick={downloadDocument}
+                disabled={!canShowPreview()}
+              >
                 Download .docx
               </button>
             </div>
