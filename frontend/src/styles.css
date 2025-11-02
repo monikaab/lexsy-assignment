@@ -66,7 +66,7 @@ button.ghost {
 .container {
   max-width: 1200px;
   margin: 0 auto;
-  padding: 2rem 1.5rem 4rem;
+  padding: 1.75rem 1rem 3.5rem;
 }
 
 .card {
@@ -74,6 +74,13 @@ button.ghost {
   border-radius: 14px;
   box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
   padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.card + .card {
+  margin-top: 1.5rem;
 }
 
 .section-title {
@@ -111,18 +118,26 @@ button.ghost {
 
 .layout {
   display: grid;
-  gap: 1.5rem;
+  gap: 1.75rem;
   grid-template-columns: 1fr;
 }
 
 @media (min-width: 992px) {
   .layout {
     grid-template-columns: 1fr 0.9fr;
+    align-items: start;
+    gap: 1.5rem;
+    margin-top: 1.5rem;
+  }
+
+  .card + .card {
+    margin-top: 0;
   }
 }
 
 .document-preview {
-  height: 70vh;
+  min-height: 26rem;
+  max-height: 68vh;
   overflow: auto;
   padding: 1.25rem;
   border-radius: 12px;
@@ -143,6 +158,7 @@ button.ghost {
   max-height: 45vh;
   overflow-y: auto;
   padding-right: 0.5rem;
+  scroll-behavior: smooth;
 }
 
 .chat-bubble {
@@ -194,10 +210,10 @@ button.ghost {
 }
 
 .app-header {
-  margin-bottom: 2rem;
+  margin-bottom: 2.25rem;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0.6rem;
   align-items: flex-start;
 }
 
@@ -247,4 +263,55 @@ button.ghost {
 
 .status.success {
   color: #1b8a6b;
+}
+
+@media (max-width: 768px) {
+  :root {
+    font-size: 15px;
+  }
+
+  .container {
+    padding: 1.5rem 0.9rem 3rem;
+  }
+
+  .document-preview {
+    min-height: 22rem;
+    max-height: 60vh;
+  }
+
+  .chat-thread {
+    max-height: 55vh;
+  }
+}
+
+@media (max-width: 520px) {
+  :root {
+    font-size: 14px;
+  }
+
+  .card {
+    padding: 1.25rem;
+    gap: 1rem;
+  }
+
+  .section-title {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  .chat-actions {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .chat-actions button {
+    width: 100%;
+  }
+
+  textarea,
+  input {
+    width: 100%;
+  }
 }

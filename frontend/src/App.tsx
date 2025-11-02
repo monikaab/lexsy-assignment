@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, Show } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, Show } from 'solid-js';
 import DOMPurify from 'dompurify';
 
 interface Placeholder {
@@ -56,6 +56,7 @@ export default function App() {
   const [statusMessage, setStatusMessage] = createSignal<string | null>(null);
   const [errorMessage, setErrorMessage] = createSignal<string | null>(null);
   const [selectedFileName, setSelectedFileName] = createSignal<string | null>(null);
+  let chatThreadRef: HTMLDivElement | undefined;
 
   const placeholderCount = createMemo(() => documentMeta()?.placeholders.length ?? 0);
   const answeredCount = createMemo(() => answeredPlaceholderIds().length);
@@ -88,6 +89,15 @@ export default function App() {
     setErrorMessage(null);
     setSelectedFileName(null);
   }
+
+  createEffect(() => {
+    chatMessages();
+    queueMicrotask(() => {
+      if (chatThreadRef) {
+        chatThreadRef.scrollTop = chatThreadRef.scrollHeight;
+      }
+    });
+  });
 
   function handleFileChange(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
@@ -340,7 +350,7 @@ export default function App() {
               </div>
             </div>
 
-            <div class="chat-thread">
+            <div class="chat-thread" ref={chatThreadRef}>
               <Show when={!chatMessages().length && chatLoading()}>
                 <div class="status">Preparing your first question…</div>
               </Show>
