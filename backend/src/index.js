@@ -7,6 +7,7 @@ import mammoth from 'mammoth';
 import { v4 as uuid } from 'uuid';
 import OpenAI from 'openai';
 import PDFDocument from 'pdfkit';
+import { load } from 'cheerio';
 
 dotenv.config();
 
@@ -829,21 +830,10 @@ function createPdfFromHtml(html) {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      const paragraphs = htmlToParagraphs(html);
+      doc.font('Helvetica').fontSize(12);
 
-      doc.fontSize(12);
-      paragraphs.forEach((paragraph, index) => {
-        if (paragraph.type === 'heading') {
-          doc.moveDown(index === 0 ? 0 : 0.8);
-          doc.fontSize(paragraph.level >= 3 ? 14 : 16).text(paragraph.text, { align: 'left' });
-          doc.moveDown(0.3);
-          doc.fontSize(12);
-        } else if (paragraph.type === 'list-item') {
-          doc.text(`• ${paragraph.text}`, { indent: 12, paragraphGap: 6 });
-        } else {
-          doc.text(paragraph.text, { paragraphGap: 10 });
-        }
-      });
+      const blocks = htmlToBlocks(html);
+      blocks.forEach((block) => renderBlock(doc, block));
 
       doc.end();
     } catch (error) {
@@ -852,64 +842,164 @@ function createPdfFromHtml(html) {
   });
 }
 
-function htmlToParagraphs(html) {
+function htmlToBlocks(html) {
   if (!html) {
     return [];
   }
 
-  const fragments = [];
-  let transformed = html
-    .replace(/<\s*br\s*\/?>/gi, '\n')
-    .replace(/<\s*li[^>]*>/gi, '\n• ')
-    .replace(/<\/\s*li\s*>/gi, '\n')
-    .replace(/<\/\s*(h[1-6]|p|div)\s*>/gi, '\n\n');
+  const $ = load(html);
+  const root = $('body').length ? $('body') : $.root();
+  const blocks = [];
 
-  const headingRegex = /<\s*h([1-6])[^>]*>([\s\S]*?)<\/\s*h\1\s*>/gi;
-  transformed = transformed.replace(headingRegex, (_match, level, content) => {
-    fragments.push({
-      type: 'heading',
-      level: Number(level),
-      text: decodeXmlEntities(stripHtml(content)).trim(),
-    });
-    return '\n\n';
+  root.contents().each((_, node) => {
+    blocks.push(...extractBlocks(node, $));
   });
 
-  const cleaned = stripHtml(transformed);
-  const decoded = decodeXmlEntities(cleaned);
-  const paragraphs = decoded.split(/\n{2,}/).map((item) => item.replace(/\s+\n/g, '\n').trim());
+  return blocks;
+}
 
-  let fragmentIndex = 0;
-  const result = [];
+function extractBlocks(node, $) {
+  if (!node) {
+    return [];
+  }
 
-  paragraphs.forEach((paragraph) => {
-    if (!paragraph) {
-      return;
+  if (node.type === 'text') {
+    const text = normalizeWhitespace(node.data);
+    return text ? [{ type: 'paragraph', text }] : [];
+  }
+
+  if (node.type !== 'tag') {
+    return [];
+  }
+
+  const name = node.name.toLowerCase();
+  const $node = $(node);
+
+  if (['style', 'script', 'meta', 'title'].includes(name)) {
+    return [];
+  }
+
+  if (name === 'br') {
+    return [{ type: 'break' }];
+  }
+
+  if (name === 'p' || name === 'div' || name === 'section' || name === 'article') {
+    const text = textFromElement(node, $);
+    if (text) {
+      return [{ type: 'paragraph', text }];
     }
+    return flattenChildren(node, $);
+  }
 
-    if (paragraph.startsWith('•')) {
-      paragraph
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .forEach((item) => {
-          result.push({ type: 'list-item', text: item.replace(/^•\s*/, '') });
-        });
-      return;
-    }
+  if (name === 'h1' || name === 'h2' || name === 'h3' || name === 'h4' || name === 'h5' || name === 'h6') {
+    const level = Number(name.slice(1));
+    const text = textFromElement(node, $);
+    return text ? [{ type: 'heading', level, text }] : [];
+  }
 
-    if (fragmentIndex < fragments.length) {
-      const fragment = fragments[fragmentIndex];
-      if (fragment && fragment.text.toLowerCase() === paragraph.toLowerCase()) {
-        result.push(fragment);
-        fragmentIndex += 1;
-        return;
+  if (name === 'ul' || name === 'ol') {
+    const items = [];
+    $node.children('li').each((_, li) => {
+      const itemText = textFromElement(li, $);
+      if (itemText) {
+        items.push(itemText);
       }
-    }
+    });
+    return items.length ? [{ type: 'list', ordered: name === 'ol', items }] : [];
+  }
 
-    result.push({ type: 'paragraph', text: paragraph });
+  if (name === 'table') {
+    const rows = [];
+    $node.find('tr').each((_, row) => {
+      const cells = [];
+      $(row)
+        .children('th,td')
+        .each((__, cell) => {
+          const cellText = textFromElement(cell, $);
+          cells.push(cellText);
+        });
+      if (cells.length) {
+        rows.push(cells);
+      }
+    });
+    return rows.length ? [{ type: 'table', rows }] : [];
+  }
+
+  return flattenChildren(node, $);
+}
+
+function flattenChildren(node, $) {
+  const blocks = [];
+  const children = node.childNodes || [];
+  children.forEach((child) => {
+    blocks.push(...extractBlocks(child, $));
   });
+  return blocks;
+}
 
-  return result;
+function renderBlock(doc, block) {
+  switch (block.type) {
+    case 'heading': {
+      const sizes = {
+        1: 20,
+        2: 18,
+        3: 16,
+        4: 14,
+        5: 13,
+        6: 12,
+      };
+      doc.moveDown(0.6);
+      doc.font('Helvetica-Bold').fontSize(sizes[block.level] || 14).text(block.text, { paragraphGap: 8 });
+      doc.font('Helvetica').fontSize(12);
+      break;
+    }
+    case 'list': {
+      doc.moveDown(0.3);
+      doc.list(block.items, {
+        listType: block.ordered ? 'numbered' : 'bullet',
+        bulletRadius: block.ordered ? 0 : 3,
+        textIndent: 18,
+        bulletIndent: 10,
+      });
+      doc.moveDown(0.3);
+      break;
+    }
+    case 'table': {
+      block.rows.forEach((row, index) => {
+        const line = row.join(' | ');
+        doc
+          .font(index === 0 ? 'Helvetica-Bold' : 'Helvetica')
+          .text(line, { paragraphGap: index === 0 ? 6 : 4 });
+      });
+      doc.font('Helvetica').fontSize(12);
+      doc.moveDown(0.5);
+      break;
+    }
+    case 'break': {
+      doc.moveDown(0.4);
+      break;
+    }
+    default: {
+      doc.text(block.text, { paragraphGap: 10 });
+    }
+  }
+}
+
+function textFromElement(node, $) {
+  const html = $(node).html() ?? '';
+  const decoded = decodeXmlEntities(stripHtml(html));
+  return normalizeWhitespace(decoded);
+}
+
+function normalizeWhitespace(value) {
+  if (!value) {
+    return '';
+  }
+
+  return value
+    .replace(/\s+/g, ' ')
+    .replace(/\s+\n/g, '\n')
+    .trim();
 }
 
 
