@@ -313,9 +313,11 @@ async function generateQuestionForPlaceholder(storedDocument, placeholderId) {
   const contextSnippet = placeholder.context || placeholderMeta?.innerTrimmed || '';
   const documentOverview = truncateText(storedDocument.normalizedText || '', 800);
   const signatureMode = isSignaturePlaceholder(placeholder, placeholderMeta);
-
+  const questionInstruction = signatureMode
+    ? buildSignatureQuestionInstruction(placeholder, placeholderMeta)
+    : 'Ask the user one question to obtain the correct value for this placeholder.';
   const fallbackQuestion = signatureMode
-    ? 'Please list each signing party with their full legal name, title, organisation, and any signing order notes so the signature panel can be completed.'
+    ? buildSignatureFallbackQuestion(placeholder, placeholderMeta)
     : `Please provide a value for "${placeholder.label}".`;
 
   if (!openaiClient) {
@@ -327,7 +329,7 @@ async function generateQuestionForPlaceholder(storedDocument, placeholderId) {
     'Ask the user exactly one concise, polite question to gather the information required for the placeholder.',
     'Do not propose a value yourself and do not ask multiple questions at once.',
     signatureMode
-      ? 'This placeholder powers a signature section. Ensure the user provides the full legal names, titles, and organisations for every signing party, along with any extra details needed (e.g. signing order, date lines).'
+      ? 'This placeholder is part of a signature section. Ask only for the specific signing-party detail requested and confirm you capture any names, titles, organisations, addresses, emails, and signing logistics as needed.'
       : undefined,
   ]
     .filter(Boolean)
@@ -340,9 +342,7 @@ async function generateQuestionForPlaceholder(storedDocument, placeholderId) {
       : undefined,
     contextSnippet ? `Surrounding text: ${contextSnippet}` : undefined,
     documentOverview ? `Document overview:\n${documentOverview}` : undefined,
-    signatureMode
-      ? 'Request the user to list every signing party with full name, title, organisation, and any signature block particulars (such as signing order or effective date).'
-      : 'Ask the user one question to obtain the correct value for this placeholder.',
+    questionInstruction,
   ].filter(Boolean);
 
   try {
@@ -381,6 +381,11 @@ async function generateFilledDocument(storedDocument, values) {
     const value = typeof rawValue === 'string' ? rawValue : '';
     const placeholderMeta = metadata[key];
 
+    if (placeholderMeta?.type === 'signature_label') {
+      documentXml = replaceSignatureLabelPlaceholder(documentXml, placeholderMeta, encodeXml(value));
+      continue;
+    }
+
     if (placeholderMeta?.type === 'dollar') {
       documentXml = replaceDollarPlaceholder(documentXml, placeholderMeta, encodeXml(value));
       continue;
@@ -409,6 +414,7 @@ async function discoverPlaceholders(documentXml) {
   try {
     const candidates = await detectPlaceholdersWithOpenAI(normalizedText);
     const { placeholders, metadata } = buildPlaceholdersFromCandidates(candidates, normalizedText);
+    augmentPlaceholdersWithBracketTokens(documentXml, normalizedText, placeholders, metadata);
 
     if (placeholders.length > 0) {
       return { placeholders, metadata, normalizedText };
@@ -418,6 +424,7 @@ async function discoverPlaceholders(documentXml) {
   }
 
   const fallback = extractPlaceholdersFromXml(documentXml, normalizedText);
+  augmentPlaceholdersWithBracketTokens(documentXml, normalizedText, fallback.placeholders, fallback.metadata);
   return { ...fallback, normalizedText };
 }
 
@@ -636,6 +643,123 @@ function buildPlaceholdersFromCandidates(candidates, normalizedText) {
   return { placeholders, metadata };
 }
 
+function augmentPlaceholdersWithBracketTokens(documentXml, normalizedText, placeholders, metadata) {
+  const bracketRegex = /\[\s*([^\]\r\n]+?)\s*\]/g;
+  const existingIds = new Set(placeholders.map((item) => item.id));
+  const existingRawKeys = new Set(
+    Object.values(metadata || {}).map((item) => collapseWhitespace(stringField(item?.raw).toLowerCase()))
+  );
+
+  let match;
+  let counter = 1;
+
+  while ((match = bracketRegex.exec(normalizedText)) !== null) {
+    const raw = match[0];
+    const inner = match[1] ?? '';
+    const rawKey = collapseWhitespace(raw.toLowerCase());
+
+    if (!rawKey || existingRawKeys.has(rawKey)) {
+      continue;
+    }
+
+    let baseId = sanitizeId(inner);
+    if (!baseId) {
+      baseId = `signature_field_${counter}`;
+      counter += 1;
+    }
+
+    let id = baseId;
+    let suffix = 2;
+    while (existingIds.has(id)) {
+      id = `${baseId}_${suffix}`;
+      suffix += 1;
+    }
+    existingIds.add(id);
+
+    const label = inner.trim() ? toTitleCase(inner) : deriveLabelFromId(id);
+    const context = extractContextSnippet(normalizedText, match.index, raw.length);
+
+    placeholders.push({
+      id,
+      label,
+      context,
+    });
+
+    metadata[id] = {
+      type: 'square',
+      raw,
+      innerRaw: inner,
+      innerTrimmed: inner.trim(),
+      xmlPattern: buildFlexibleXmlPattern(raw),
+      source: 'signature-bracket',
+    };
+
+    existingRawKeys.add(rawKey);
+  }
+
+  const colonRegex = /(^|\n)([A-Za-z][A-Za-z\s/&().-]{0,40}):\s*(?=$|\n)/g;
+  const colonKeywords = new Set(['address', 'email', 'name', 'title', 'by', 'its', 'phone', 'fax']);
+  while ((match = colonRegex.exec(normalizedText)) !== null) {
+    const labelText = stringField(match[2]);
+    if (!labelText) {
+      continue;
+    }
+
+    const keyword = labelText.toLowerCase();
+    if (!colonKeywords.has(keyword)) {
+      continue;
+    }
+
+    const hasExistingInner = Object.values(metadata || {}).some(
+      (item) => stringField(item?.innerTrimmed).toLowerCase() === keyword
+    );
+    if (hasExistingInner) {
+      continue;
+    }
+
+    const raw = `${labelText}:`;
+    const rawKey = collapseWhitespace(raw.toLowerCase());
+    if (existingRawKeys.has(rawKey)) {
+      continue;
+    }
+
+    let baseId = sanitizeId(`signature_${keyword}`);
+    if (!baseId) {
+      baseId = `signature_label_${counter}`;
+      counter += 1;
+    }
+
+    let id = baseId;
+    let suffix = 2;
+    while (existingIds.has(id)) {
+      id = `${baseId}_${suffix}`;
+      suffix += 1;
+    }
+    existingIds.add(id);
+
+    const label = toTitleCase(labelText);
+    const context = extractContextSnippet(normalizedText, match.index, raw.length);
+
+    placeholders.push({
+      id,
+      label,
+      context,
+    });
+
+    metadata[id] = {
+      type: 'signature_label',
+      raw,
+      innerRaw: labelText,
+      innerTrimmed: labelText,
+      labelText: labelText.endsWith(':') ? labelText : `${labelText}:`,
+      xmlPattern: buildFlexibleXmlPattern(raw),
+      source: 'signature-label',
+    };
+
+    existingRawKeys.add(rawKey);
+  }
+}
+
 function truncateText(value, maxLength) {
   if (!value) {
     return '';
@@ -715,6 +839,20 @@ function replaceCurlyPlaceholder(documentXml, placeholderMeta, key, replacement)
 
   const fallbackPattern = new RegExp(`\\{\\{\\s*${escapeRegExp(key)}\\s*\\}\\}`, 'g');
   return documentXml.replace(fallbackPattern, () => replacement);
+}
+
+function replaceSignatureLabelPlaceholder(documentXml, placeholderMeta, replacement) {
+  const labelText = stringField(placeholderMeta?.labelText) || stringField(placeholderMeta?.raw);
+  if (!labelText) {
+    return documentXml;
+  }
+
+  const encodedLabel = encodeXml(labelText.trim());
+  const xmlPattern = placeholderMeta?.xmlPattern || buildFlexibleXmlPattern(labelText);
+  const regex = new RegExp(xmlPattern, 'g');
+  const suffix = replacement ? ` ${replacement}` : '';
+
+  return documentXml.replace(regex, () => `${encodedLabel}${suffix}`);
 }
 
 function stringField(value) {
@@ -803,6 +941,10 @@ function isSignaturePlaceholder(placeholder, placeholderMeta) {
     return false;
   }
 
+  if (placeholderMeta?.source && placeholderMeta.source.startsWith('signature')) {
+    return true;
+  }
+
   const haystack = [placeholder.id, placeholder.label, placeholder.context, placeholderMeta?.innerTrimmed, placeholderMeta?.raw]
     .filter(Boolean)
     .join(' ')
@@ -812,12 +954,124 @@ function isSignaturePlaceholder(placeholder, placeholderMeta) {
     return false;
   }
 
-  const keywords = ['signature', 'signatory', 'signatures', 'signing party', 'signature panel', 'signature block'];
+  const keywords = [
+    'signature',
+    'signatory',
+    'signatures',
+    'signing party',
+    'signature panel',
+    'signature block',
+    'in witness',
+    'witness whereof',
+  ];
   return keywords.some((keyword) => haystack.includes(keyword));
 }
 
 function stripHtml(value) {
   return value.replace(/<[^>]+>/g, ' ');
+}
+
+function determineSignatureField(placeholder, placeholderMeta) {
+  const combined = [placeholder?.label, placeholder?.id, placeholderMeta?.innerTrimmed, placeholderMeta?.raw, placeholder?.context]
+    .map((value) => stringField(value).toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+
+  if (!combined) {
+    return 'generic';
+  }
+
+  if (combined.includes('witness')) {
+    return 'witness';
+  }
+
+  if (combined.includes('company') || combined.includes('investor') || combined.includes('entity')) {
+    return 'company';
+  }
+
+  if (combined.includes('by') || combined.includes('signer') || combined.includes('signatory') || combined.includes('name')) {
+    return 'signer_name';
+  }
+
+  if (combined.includes('title') || combined.includes('position')) {
+    return 'signer_title';
+  }
+
+  if (combined.includes('email') || combined.includes('e-mail')) {
+    return 'email';
+  }
+
+  if (combined.includes('address')) {
+    return 'address';
+  }
+
+  if (combined.includes('date')) {
+    return 'date';
+  }
+
+  if (combined.includes('phone') || combined.includes('telephone')) {
+    return 'phone';
+  }
+
+  if (combined.includes('signature block') || combined.includes('signature line')) {
+    return 'block';
+  }
+
+  return 'generic';
+}
+
+function buildSignatureQuestionInstruction(placeholder, placeholderMeta) {
+  const field = determineSignatureField(placeholder, placeholderMeta);
+
+  switch (field) {
+    case 'company':
+      return 'Ask the user for the full legal name of the company or entity signing on this line.';
+    case 'signer_name':
+      return 'Ask the user for the full name of the individual who will sign, including honorifics if relevant.';
+    case 'signer_title':
+      return 'Ask the user for the job title or position of the signer, exactly as it should appear.';
+    case 'address':
+      return 'Ask the user for the complete mailing address for this signing party.';
+    case 'email':
+      return 'Ask the user for the contact email for this signing party.';
+    case 'date':
+      return 'Ask the user what signing date should be shown, or whether the line should remain blank.';
+    case 'phone':
+      return 'Ask the user for the preferred phone number for this signing party, if one should appear.';
+    case 'witness':
+      return 'Ask the user for the witness’s full name, role, and any required contact information.';
+    case 'block':
+      return 'Ask the user to provide every detail needed for the full signature block (names, titles, organisations, contact information, signing order).';
+    default:
+      return 'Ask the user for the specific information needed to complete this signature line.';
+  }
+}
+
+function buildSignatureFallbackQuestion(placeholder, placeholderMeta) {
+  const field = determineSignatureField(placeholder, placeholderMeta);
+
+  switch (field) {
+    case 'company':
+      return 'Please provide the full legal name of the company or entity signing here.';
+    case 'signer_name':
+      return 'Who will sign on behalf of the company? Please share the signer’s full name.';
+    case 'signer_title':
+      return 'What title or position should appear under the signer’s name?';
+    case 'address':
+      return 'Please provide the complete mailing address for this signing party.';
+    case 'email':
+      return 'What email address should be listed for this signing party?';
+    case 'date':
+      return 'Which signing date should appear on this line (or should it remain blank)?';
+    case 'phone':
+      return 'What phone number should appear for this signing party?';
+    case 'witness':
+      return 'Please provide the witness’s name, role, and any required contact information.';
+    case 'block':
+      return 'Please list every signing party with names, titles, organisations, and contact details so the signature block can be completed.';
+    default:
+      return `Please provide the information needed to complete "${placeholder?.label ?? 'this signature field'}".`;
+  }
 }
 
 function createPdfFromHtml(html) {
@@ -1002,6 +1256,27 @@ function normalizeWhitespace(value) {
     .trim();
 }
 
+function collapseWhitespace(value) {
+  if (!value) {
+    return '';
+  }
+
+  return value.replace(/\s+/g, '').trim();
+}
+
+function toTitleCase(value) {
+  if (!value) {
+    return '';
+  }
+
+  return value
+    .toLowerCase()
+    .split(/\s+/)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+    .trim();
+}
+
 
 function decodeXmlEntities(value) {
   return value
@@ -1061,6 +1336,10 @@ app.use((err, _req, res, _next) => {
   return res.status(500).json({ error: 'Unknown server error' });
 });
 
-app.listen(port, () => {
-  console.log(`Backend listening on http://localhost:${port}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Backend listening on http://localhost:${port}`);
+  });
+}
+
+export default app;
