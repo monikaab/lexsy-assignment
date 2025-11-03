@@ -14,11 +14,6 @@
       "use": "@vercel/node"
     }
   ],
-  "functions": {
-    "backend/src/index.js": {
-      "runtime": "nodejs18.x"
-    }
-  },
   "routes": [
     {
       "src": "/api/(.*)",
