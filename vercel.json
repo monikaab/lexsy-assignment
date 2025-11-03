@@ -20,6 +20,10 @@
       "dest": "backend/src/index.js"
     },
     {
+      "src": "/health",
+      "dest": "backend/src/index.js"
+    },
+    {
       "handle": "filesystem"
     },
     {
